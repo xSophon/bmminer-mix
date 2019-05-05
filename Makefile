@@ -60,12 +60,14 @@ XILINX_LIBDIR = $(USR)/lib
 
 # The pre-processor and compiler options.
 # MY_CFLAGS = -ggdb3 -pipe -O2 -Wall -Wextra -fopenmp -march=native -mfpmath=sse -DLINUX -m64 -std=c++0x
+# MY_CFLAGS = -O0 -g -ggdb3 -pthread -I./ -I./ccan/opt -I./compat/jansson-2.6/src -I./lib
 MY_CFLAGS = -O2 -pthread -I$(XILINX_INC) -L$(XILINX_LIBDIR) -I./ -I./ccan/opt -I./compat/jansson-2.6/src -I./lib -I$(XILINX_OTHER_LIB_BASE_PATH)/include
+MY_CFLAGS += -DHAVE_AN_ASIC
 #-Itest1/include -Itest2/include -Itest1/include/test1 -Itest2/include/test2
 
 # The linker options.
 # MY_LIBS   = -lGLEW -lglut -lGLU -lGL -lX11 -lXmu -lXi -lm -L/usr/X11R6/lib -lgomp -lOpenThreads -lpthread
-MY_LIBS   = -lm -lrt $(XILINX_OTHER_LIB_BASE_PATH)/lib/libz.a
+MY_LIBS   = -lm -lrt $(XILINX_OTHER_LIB_BASE_PATH)/libz.a
 
 # The pre-processor options used by the cpp (man cpp for more).
 CPPFLAGS  = 
@@ -96,12 +98,13 @@ HDREXTS = .h .H .hh .hpp .HPP .h++ .hxx .hp
 # Users can override those variables from the command line.
 CFLAGS  = 
 # CXXFLAGS= -std=c++0x
-CXXFLAGS= 
+CXXFLAGS=
+CROSS_PREFIX=
 # The C program compiler.
-CC     = $(XILINX_BASE_PATH)/bin/arm-linux-gnueabihf-gcc
+CC     = /usr/bin/arm-linux-gnueabihf-gcc
 
 # The C++ program compiler.
-CXX    = $(XILINX_BASE_PATH)/bin/arm-linux-gnueabihf-g++
+CXX    = /usr/bin/arm-linux/gnueabihf-g++
 
 # Un-comment the following line to compile C programs as C++ ones.
 #CC     = $(CXX)

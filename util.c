@@ -1919,6 +1919,14 @@ static char *json_array_string(json_t *val, unsigned int entry)
 
 static char *blank_merkle = "0000000000000000000000000000000000000000000000000000000000000000";
 
+#define VERSION_BITS_NUM 2
+#define VERSION_BITS_THAT_S9_ROLLS 0x00c00000
+#if MIDSTATE_NUM != (1UL << VERSION_BITS_NUM)
+#error Incompatible number of midstates and version bits to roll!
+#endif
+
+struct block_version n_version[MIDSTATE_NUM];
+
 static bool parse_notify(struct pool *pool, json_t *val)
 {
     char *job_id, *prev_hash, *coinbase1, *coinbase2, *bbversion, *nbit,
@@ -2166,6 +2174,89 @@ static bool parse_extranonce(struct pool *pool, json_t *val)
 
 }
 
+/**
+ * Decodes version mask from json string
+ *
+ * @param pool
+ * @param version_mask_json
+ * @return true when the decoded mask is valid and supported by the hardware
+ */
+static bool decode_version_mask(struct pool *pool, json_t *version_mask_json)
+{
+    const char *version_mask_str;
+    unsigned long version_mask;
+    unsigned int i, j, bit_idx, component_idx;
+    unsigned long version_bit_components[VERSION_BITS_NUM];
+    unsigned long detect_bit_mask;
+    bool retval = true;
+
+    if (!version_mask_json) {
+        applog(LOG_ERR, "Received empty version mask!");
+        retval = false;
+        goto invalid_version_mask;
+    }
+
+    version_mask_str = json_string_value(version_mask_json);
+
+    version_mask = strtol(version_mask_str, NULL, 16);
+    detect_bit_mask = 1;
+    bit_idx = 0;
+    component_idx = 0;
+
+    /* If version mask doesn't support bits we can roll, bail out */
+    if ((version_mask & VERSION_BITS_THAT_S9_ROLLS) != VERSION_BITS_THAT_S9_ROLLS) {
+        applog(LOG_ERR, "Received version mask (0x%08lx) doesn't satisfy hardware requirement (0x%08lx)",
+                           version_mask, VERSION_BITS_THAT_S9_ROLLS);
+        retval = false;
+        goto invalid_version_mask;
+    }
+
+    /* Scan the version mask and extract masks for individual bits to satisfy
+     * the number of version bits */
+    while ((bit_idx < (sizeof(version_mask) * 8)) && (component_idx < VERSION_BITS_NUM)) {
+        if (version_mask & detect_bit_mask) {
+            version_bit_components[component_idx++] = detect_bit_mask;
+        }
+        detect_bit_mask = detect_bit_mask << 1;
+        bit_idx++;
+    }
+
+    if (component_idx != VERSION_BITS_NUM) {
+        applog(LOG_ERR, "Received version mask (0x%08lx) doesn't satisfy hardware requirement (detected %d bits, "
+                           "required %d bits)", version_mask, component_idx, VERSION_BITS_NUM);
+        retval = false;
+        goto invalid_version_mask;
+    }
+
+    /* Pre-generate all permutations of version bits */
+    for (i = 0; i < (1UL << VERSION_BITS_NUM); i++) {
+        n_version[i].bits = 0;
+        for (bit_idx = 0; bit_idx < (sizeof(i) * 8); bit_idx++) {
+            if (i & (1UL << bit_idx)) {
+                n_version[i].bits |= version_bit_components[bit_idx];
+            }
+        }
+        /* Update mask string used for mining.submit version_bits parameter */
+        sprintf(n_version[i].bits_str, "%08x", n_version[i].bits);
+    }
+
+  invalid_version_mask:
+    return retval;
+}
+
+/**
+ * Parses mining.set_version_mask message
+ *
+ * @param pool
+ * @param params - array of JSON parameters of mining.set_version_mask
+ * @return true when a valid mask has been parsed
+ */
+static bool parse_set_version_mask(struct pool *pool, json_t *params)
+{
+    /* Extract the first parameter and delegate further */
+    return decode_version_mask(pool, json_array_get(params, 0));
+}
+
 static void __suspend_stratum(struct pool *pool)
 {
     clear_sockbuf(pool);
@@ -2331,20 +2422,17 @@ bool parse_method(struct pool *pool, char *s)
     if (!buf)
         goto out_decref;
 
-    if (!strncasecmp(buf, "mining.multi_version", 20))
-    {
-        pool->support_vil = true;
-        applog(LOG_INFO,"Pool support multi version");
-        ret = parse_version(pool, params);
-        goto out_decref;
-    }
-
     if (!strncasecmp(buf, "mining.notify", 13))
     {
         if (parse_notify(pool, params))
             pool->stratum_notify = ret = true;
         else
             pool->stratum_notify = ret = false;
+        goto out_decref;
+    }
+
+    if (!strncasecmp(buf, "mining.set_version_mask", 23)) {
+        ret = parse_set_version_mask(pool, params);
         goto out_decref;
     }
 
@@ -2972,10 +3060,108 @@ void suspend_stratum(struct pool *pool)
     mutex_unlock(&pool->stratum_lock);
 }
 
+
+#define STRATUM_VERSION_ROLLING "version-rolling"
+#define STRATUM_VERSION_ROLLING_LEN (sizeof(STRATUM_VERSION_ROLLING) - 1)
+
+/**
+ * Configures stratum mining based on connected hardware capabilities
+ * (version rolling etc.)
+ *
+ * Sample communication
+ * Request:
+ * {"id": 1, "method": "mining.configure", "params": [ ["version-rolling", "sp-telemetry"], { "version-rolling.bit-count": 2, "version-rolling.mask": "ffffffff" }]}\n
+ * Response:
+ * {"id": 1, "result": { "version-rolling": True, "sp-telemetry": True }, "error": null}\n
+ *
+ * @param pool
+ *
+ *
+ * @return
+ */
+static bool configure_stratum_mining(struct pool *pool)
+{
+    char s[RBUFSIZE];
+    char *response_str = NULL;
+    bool config_status = false;
+    bool version_rolling_status = false;
+    bool version_mask_valid = false;
+    const char *key;
+    json_t *response, *value, *res_val, *err_val;
+    json_error_t err;
+
+    /* TODO JCA: read version rolling bits and mask from the hardware driver
+     * or pool parameters? */
+    snprintf(s, RBUFSIZE,
+             "{\"id\": %d, \"method\": \"mining.configure\", \"params\": "
+             "[[\""STRATUM_VERSION_ROLLING"\"], "
+                                          "{\""STRATUM_VERSION_ROLLING".bit-count\": %d, "
+                                                                      "\""STRATUM_VERSION_ROLLING".mask\": \"%x\"}]}",
+             swork_id++, 2, 0xffffffff);
+
+    if (__stratum_send(pool, s, strlen(s)) != SEND_OK) {
+        applog(LOG_DEBUG, "Failed to send mining.configure");
+        goto out;
+    }
+    if (!socket_full(pool, DEFAULT_SOCKWAIT)) {
+        applog(LOG_DEBUG, "Timed out waiting for response in %s", __FUNCTION__);
+        goto out;
+    }
+    response_str = recv_line(pool);
+    if (!response_str)
+        goto out;
+
+    response = JSON_LOADS(response_str, &err);
+    free(response_str);
+
+    res_val = json_object_get(response, "result");
+    err_val = json_object_get(response, "error");
+
+    if (!res_val || json_is_null(res_val) ||
+        (err_val && !json_is_null(err_val))) {
+        char *ss;
+
+        if (err_val)
+            ss = json_dumps(err_val, JSON_INDENT(3));
+        else
+            ss = strdup("(unknown reason)");
+
+        applog(LOG_INFO, "JSON-RPC decode failed: %s", ss);
+
+        free(ss);
+
+        goto json_response_error;
+    }
+    json_object_foreach(res_val, key, value)
+    {
+        if (!strcasecmp(key, STRATUM_VERSION_ROLLING) &&
+            strlen(key) == STRATUM_VERSION_ROLLING_LEN) {
+            version_rolling_status = json_boolean_value(value);
+        }
+        else if (!strcasecmp(key, STRATUM_VERSION_ROLLING ".mask")) {
+            version_mask_valid = decode_version_mask(pool, value);
+        }
+        else {
+            applog(LOG_ERR, "JSON-RPC unexpected mining.configure value: %s", key);
+        }
+    }
+    /* Valid configuration for now only requires enabled version rolling and valid bit mask */
+    config_status = version_rolling_status && version_mask_valid;
+    if (config_status) {
+        pool->supports_version_rolling = true;
+    }
+
+  json_response_error:
+    json_decref(response);
+
+  out:
+    return config_status;
+}
+
 bool initiate_stratum(struct pool *pool)
 {
-    bool ret = false, recvd = false, noresume = false, sockd = false;
-    char s[RBUFSIZE], *sret = NULL, *nonce1, *sessionid;
+    bool ret = false, recvd = false, noresume = false, sockd = false, notification_received = false;
+    char s[RBUFSIZE], *sret = NULL, *nonce1, *sessionid, *tmp;
     json_t *val = NULL, *res_val, *err_val;
     json_error_t err;
     int n2size;
@@ -2989,18 +3175,24 @@ resend:
 
     sockd = true;
 
-    if (recvd)
-    {
-        /* Get rid of any crap lying around if we're resending */
+    /* Get rid of any crap lying around if we're resending */
+    if (recvd) {
         clear_sock(pool);
+    }
+	/* Attempt to configure stratum protocol feature set first. */
+	if (!configure_stratum_mining(pool)) {
+		goto out;
+	}
+
+	if (recvd) {
         sprintf(s, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": []}", swork_id++);
     }
     else
     {
         if (pool->sessionid)
-            sprintf(s, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": [\""PACKAGE"/"VERSION"\", \"%s\"]}", swork_id++, pool->sessionid);
+            sprintf(s, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": [\"bitfarms-fw-1.21\", \"%s\"]}", swork_id++, pool->sessionid);
         else
-            sprintf(s, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": [\""PACKAGE"/"VERSION"\"]}", swork_id++);
+            sprintf(s, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": [\"bitfarms-fw-1.21\"]}", swork_id++);
     }
 
     if (__stratum_send(pool, s, strlen(s)) != SEND_OK)
@@ -3015,11 +3207,16 @@ resend:
         goto out;
     }
 
+	/* Filter out all notifications and wait for the response */
+	notification_received = true;
+	while (notification_received) {
     sret = recv_line(pool);
     if (!sret)
         goto out;
-
     recvd = true;
+		/* Parse any notification including set_version_mask */
+		notification_received = parse_method(pool, sret);
+	}
 
     val = JSON_LOADS(sret, &err);
     free(sret);

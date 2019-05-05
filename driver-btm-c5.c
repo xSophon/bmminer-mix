@@ -50,6 +50,11 @@
 #include "miner.h"
 // #include "usbutils.h"
 
+#ifdef DEBUG_LOG
+#undef applog
+#define applog(prio, fmt, ...) do { printf(fmt, ##__VA_ARGS__); } while (0)
+#endif
+
 #define MAX_CHAR_NUM    1024
 
 extern void reCalculateAVG();
@@ -154,8 +159,7 @@ bool is218_Temp=false;
 static struct init_config config_parameter;
 
 //global various
-int fd;                                         // axi fpga
-int fd_fpga_mem;                                // fpga memory
+int fd_mem;                                     // for mapping FPGA regions
 int fpga_version;
 int pcb_version;
 unsigned int *axi_fpga_addr = NULL;             // axi address
@@ -196,8 +200,6 @@ int last_temperature = 0, temp_highest = 0;
 
 bool opt_bitmain_fan_ctrl = false;
 int opt_bitmain_fan_pwm = 0;
-int opt_bitmain_c5_freq = 600;
-int opt_bitmain_c5_voltage = 176;
 int ADD_FREQ = 0;
 int ADD_FREQ1 = 0;
 uint8_t de_voltage = 176;
@@ -221,14 +223,21 @@ bool check_temp_offside = false;
 
 double chain_asic_RT[BITMAIN_MAX_CHAIN_NUM][CHAIN_ASIC_NUM]= {0};
 
+uint32_t g_accepted[BITMAIN_MAX_CHAIN_NUM] = {0};
+uint32_t g_rejected[BITMAIN_MAX_CHAIN_NUM] = {0};
 uint64_t rate[BITMAIN_MAX_CHAIN_NUM] = {0};
 uint64_t nonce_num[BITMAIN_MAX_CHAIN_NUM][BITMAIN_DEFAULT_ASIC_NUM][TIMESLICE] = {0};
 int nonce_times = 0;
 int rate_error[BITMAIN_MAX_CHAIN_NUM] = {0};
 char displayed_rate[BITMAIN_MAX_CHAIN_NUM][32];
 
+/* these are freq/voltage settings requested by user (numbered from first existent chain) */
+int chain_voltage_settings[BITMAIN_MAX_CHAIN_NUM] = {0};
+int chain_frequency_settings[BITMAIN_MAX_CHAIN_NUM] = {0};
+/* these are freq/voltage settings actually used (numbered by physical connection) */
 uint8_t chain_voltage_pic[BITMAIN_MAX_CHAIN_NUM] = {0xff};
 int chain_voltage_value[BITMAIN_MAX_CHAIN_NUM] = {0};
+int chain_frequency_value[BITMAIN_MAX_CHAIN_NUM] = {0};
 
 unsigned char hash_board_id[BITMAIN_MAX_CHAIN_NUM][12];
 
@@ -303,32 +312,7 @@ bool isFixedFreqMode()
 
 bool isC5_Board()
 {
-    FILE *fd;
-    char board_type[32];
-    int isC5=0;
-
-    memset(board_type,'\0',32);
-
-    fd=fopen("/usr/bin/ctrl_bd","rb");
-    if(fd)
-    {
-        fread(board_type,1,32,fd);
-        fclose(fd);
-
-        if(strstr(board_type,"XILINX"))
-        {
-            isC5=0;
-        }
-        else isC5=1;
-    }
-    else
-    {
-        isC5=1;
-    }
-
-    if(isC5)
-        return true;
-    else return false;
+    return system("grep -q 'Xilinx' /proc/cpuinfo") != 0;
 }
 
 void software_set_address();
@@ -1577,7 +1561,6 @@ void set_pic_iic_flash_addr_pointer(unsigned char chain, unsigned char addr_H, u
             //  pthread_mutex_unlock(&iic_mutex);
 
             //printf("--- %s: read_back_data[0] = 0x%x, read_back_data[1] = 0x%x\n", __FUNCTION__, read_back_data[0], read_back_data[1]);
-
             if((read_back_data[0] != SET_VOLTAGE) || (read_back_data[1] != 1))
             {
                 sprintf(logstr,"%s failed on Chain[%d]!\n\n", __FUNCTION__,which_iic);
@@ -1716,7 +1699,7 @@ void set_pic_iic_flash_addr_pointer(unsigned char chain, unsigned char addr_H, u
     void set_pic_voltage(unsigned char chain, unsigned char voltage)
     {
         send_pic_command(chain);
-        applog(LOG_NOTICE,"%s voltage %u",__FUNCTION__,voltage);
+        applog(LOG_NOTICE, "%s: chain %d: setting voltage %.2lfV (PIC=%u)",__FUNCTION__,chain, getVolValueFromPICvoltage(voltage)/100.0, voltage);
         write_pic_iic(false, false, 0x0, chain, SET_VOLTAGE);
         write_pic_iic(false, false, 0x0, chain, voltage);
         cgsleep_us(100000);
@@ -1728,7 +1711,7 @@ void set_pic_iic_flash_addr_pointer(unsigned char chain, unsigned char addr_H, u
         send_pic_command(chain);
         write_pic_iic(false, false, 0x0, chain, GET_VOLTAGE);
         ret = write_pic_iic(true, false, 0x0, chain, 0);
-        applog(LOG_NOTICE,"%s: voltage = %d\n", __FUNCTION__, ret);
+        applog(LOG_NOTICE,"%s: voltage = %d", __FUNCTION__, ret);
         return ret;
     }
 
@@ -2393,15 +2376,15 @@ void set_pic_iic_flash_addr_pointer(unsigned char chain, unsigned char addr_H, u
         unsigned int data;
         int ret=0;
 
-        fd = open("/dev/axi_fpga_dev", O_RDWR);
-        if(fd < 0)
+        fd_mem = open("/dev/mem", O_RDWR);
+        if(fd_mem < 0)
         {
-            applog(LOG_DEBUG,"/dev/axi_fpga_dev open failed. fd = %d\n", fd);
+            applog(LOG_DEBUG,"/dev/mem open failed. fd = %d\n", fd_mem);
             perror("open");
             return -1;
         }
 
-        axi_fpga_addr = mmap(NULL, TOTAL_LEN, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        axi_fpga_addr = mmap(NULL, TOTAL_LEN, PROT_READ|PROT_WRITE, MAP_SHARED, fd_mem, AXI_FPGA_BASE_ADDRESS_XILINX);
         if(!axi_fpga_addr)
         {
             applog(LOG_DEBUG,"mmap axi_fpga_addr failed. axi_fpga_addr = 0x%x\n", axi_fpga_addr);
@@ -2418,15 +2401,7 @@ void set_pic_iic_flash_addr_pointer(unsigned char chain, unsigned char addr_H, u
         }
         applog(LOG_DEBUG,"axi_fpga_addr data = 0x%x\n", data);
 
-        fd_fpga_mem = open("/dev/fpga_mem", O_RDWR);
-        if(fd_fpga_mem < 0)
-        {
-            applog(LOG_DEBUG,"/dev/fpga_mem open failed. fd_fpga_mem = %d\n", fd_fpga_mem);
-            perror("open");
-            return -1;
-        }
-
-        fpga_mem_addr = mmap(NULL, FPGA_MEM_TOTAL_LEN, PROT_READ|PROT_WRITE, MAP_SHARED, fd_fpga_mem, 0);
+        fpga_mem_addr = mmap(NULL, FPGA_MEM_TOTAL_LEN, PROT_READ|PROT_WRITE, MAP_SHARED, fd_mem, PHY_MEM_NONCE2_JOBID_ADDRESS);
         if(!fpga_mem_addr)
         {
             applog(LOG_DEBUG,"mmap fpga_mem_addr failed. fpga_mem_addr = 0x%x\n", fpga_mem_addr);
@@ -2503,8 +2478,7 @@ void set_pic_iic_flash_addr_pointer(unsigned char chain, unsigned char addr_H, u
         //free(temp_job_start_address_1);
         //free(temp_job_start_address_2);
 
-        close(fd);
-        close(fd_fpga_mem);
+        close(fd_mem);
     }
 
     int get_fan_control(void)
@@ -3363,25 +3337,13 @@ void set_Hardware_version(unsigned int value)
     static void get_plldata(int type,int freq,uint32_t * reg_data,uint16_t * reg_data2, uint32_t *vil_data)
     {
         uint32_t i;
-        char freq_str[10];
-        sprintf(freq_str,"%d", freq);
         char plldivider1[32] = {0};
         char plldivider2[32] = {0};
         char vildivider[32] = {0};
 
-        if(type == 1385)
-        {
-            for(i=0; i < sizeof(freq_pll_1385)/sizeof(freq_pll_1385[0]); i++)
-            {
-                if( memcmp(freq_pll_1385[i].freq, freq_str, sizeof(freq_pll_1385[i].freq)) == 0)
-                    break;
-            }
-        }
+	assert(type == 1385);
 
-        if(i == sizeof(freq_pll_1385)/sizeof(freq_pll_1385[0]))
-        {
-            i = 4;
-        }
+	i = get_pll_index(freq);
 
         sprintf(plldivider1, "%08x", freq_pll_1385[i].fildiv1);
         sprintf(plldivider2, "%04x", freq_pll_1385[i].fildiv2);
@@ -3484,32 +3446,45 @@ void set_Hardware_version(unsigned int value)
         }
     }
 
+    /* always return _some_ valid index */
     int get_pll_index(int freq)
     {
-
         int i;
-        char freq_str[10];
-        sprintf(freq_str,"%d", freq);
-
-        for(i=0; i < sizeof(freq_pll_1385)/sizeof(freq_pll_1385[0]); i++)
-        {
-            if( memcmp(freq_pll_1385[i].freq, freq_str, sizeof(freq_pll_1385[i].freq)) == 0)
-                break;
+	int n = sizeof(freq_pll_1385) / sizeof(freq_pll_1385[0]);
+        for (i = 0; i < n; i++) {
+		int tab_freq = atoi(freq_pll_1385[i].freq);
+		if (freq <= tab_freq)
+			break;
         }
 
-
-        if(i == sizeof(freq_pll_1385)/sizeof(freq_pll_1385[0]))
-        {
-            i = -1;
+        if(i >= n) {
+            i = n - 1;
         }
 
         return i;
+    }
 
+    int get_pll_index_clamp(int freq)
+    {
+        if (freq == 0)
+            freq = DEFAULT_FREQ;
+        if (freq < MIN_FREQ)
+            freq = MIN_FREQ;
+        if (freq > MAX_FREQ)
+            freq = MAX_FREQ;
+        return get_pll_index(freq);
     }
 
     int get_freqvalue_by_index(int index)
     {
         return atoi(freq_pll_1385[index].freq);
+    }
+
+    int normalize_freq_clamp(int freq)
+    {
+        int index;
+        index = get_pll_index_clamp(freq);
+        return get_freqvalue_by_index(index);
     }
 
     int GetTotalRate()
@@ -3705,7 +3680,7 @@ void set_Hardware_version(unsigned int value)
                     continue;
 
                 //down one step on highest chip, but freq must be > 250M
-                if(max_freq<=MIN_FREQ)
+                if(max_freq<=MIN_FREQ_INDEX)
                     continue;
                 else
                 {
@@ -3791,7 +3766,7 @@ void set_Hardware_version(unsigned int value)
         }
 
         //down one step on highest chip, but freq must be > 250M
-        if(max_freq<=MIN_FREQ)
+        if(max_freq<=MIN_FREQ_INDEX)
         {
             sprintf(logstr,"Fatal Error: DownOneChipFreqOneStep Chain[%d] has no chip can down freq!!!\n",max_rate_chainIndex);
             writeInitLogFile(logstr);
@@ -3975,7 +3950,9 @@ void set_Hardware_version(unsigned int value)
             fclose(fd);
         }
         pthread_mutex_unlock(&init_log_mutex);
-        //printf(logstr);
+#ifdef DEBUG_LOG
+        printf(logstr);
+#endif
     }
 
     void clearInitLogFile()
@@ -4002,764 +3979,71 @@ void set_Hardware_version(unsigned int value)
         pthread_mutex_unlock(&init_log_mutex);
     }
 
-    void set_frequency(unsigned short int frequency)
-    {
-        unsigned char buf[9] = {0,0,0,0,0,0,0,0,0};
-        unsigned int cmd_buf[3] = {0,0,0};
-        int i,j,k,max_freq_index = 0,step_down = 0;
-        unsigned int ret, value;
-        uint32_t reg_data_pll = 0;
-        uint16_t reg_data_pll2 = 0;
-        uint32_t reg_data_vil = 0;
-        int chain_max_freq,chain_min_freq;
-        unsigned char minerMAC[6];
-        unsigned char hashMAC[6];   // single board test write control board's MAC into hashbaord
-        unsigned char vol_pic;
-        int vol_value;
-        int default_freq_index=get_pll_index(frequency);
-        char logstr[256];
-
-        applog(LOG_DEBUG,"\n--- %s\n", __FUNCTION__);
-
-        get_plldata(1385, frequency, &reg_data_pll, &reg_data_pll2, &reg_data_vil);
-        applog(LOG_DEBUG,"%s: frequency = %d\n", __FUNCTION__, frequency);
-
-        //////////////// set default freq when no freq in PIC //////////////////////////////
-        for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
-        {
-            if(dev->chain_exist[i] == 1 && dev->chain_asic_num[i]>0)
-            {
-#ifdef T9_18
-                if (isFixedFreqMode() || getChainPICMagicNumber(i) != FREQ_MAGIC)
-#else
-                if (isFixedFreqMode() || last_freq[i][1] != FREQ_MAGIC)
-#endif
-                {
-                    isUseDefaultFreq=true;
-
-#ifdef T9_18
-                    if(fpga_version>=0xE)
-                    {
-                        int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                        getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-                        chain_pic_buf[new_T9_PLUS_chainIndex][0]=FREQ_MAGIC;
-
-                        for(k=0; k<3; k++)  // if chain[1] has no magic number, then we need set chain[1] [8] [9] 's freq to default freq!!!
-                        {
-                            for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                            {
-                                chain_pic_buf[new_T9_PLUS_chainIndex][7+k*31+4+j]=default_freq_index;   // default is config file's freq
-                            }
-                        }
-                    }
-                    else
-                    {
-                        chain_pic_buf[((i/3)*3)][0]=FREQ_MAGIC;
-
-                        for(k=i; k<i+3; k++) // if chain[0] has no magic number, then we need set chain[0] [1] [2] 's freq to default freq!!!
-                        {
-                            for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                            {
-                                chain_pic_buf[((k/3)*3)][7+(k%3)*31+4+j]=default_freq_index;    // default is config file's freq
-                            }
-                        }
-                    }
-#else
-                    last_freq[i][0]=0;
-                    last_freq[i][1]=FREQ_MAGIC;
-
-                    for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                    {
-                        last_freq[i][j*2+2]=0;
-                        last_freq[i][j*2+3]=default_freq_index; // default is config file's freq
-                    }
-#endif
-                    sprintf(logstr,"Chain[J%d] has no freq in PIC, set default freq=%dM\n",i+1,frequency);
-                    writeInitLogFile(logstr);
-                }
-
-#ifdef T9_18
-                if(fpga_version>=0xE)
-                {
-                    int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                    getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-
-                    if(chain_pic_buf[new_T9_PLUS_chainIndex][0]==FREQ_MAGIC && (!isUseDefaultFreq))
-                    {
-                        sprintf(logstr,"Chain[J%d] has core num in PIC\n",i+1);
-                        writeInitLogFile(logstr);
-
-                        for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                        {
-                            if(j%2)
-                                chain_badcore_num[i][j]=(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+22+(j/2)]&0x0f);
-                            else chain_badcore_num[i][j]=(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+22+(j/2)]>>4)&0x0f;
-
-                            if(chain_badcore_num[i][j]>0)
-                            {
-                                sprintf(logstr,"Chain[J%d] ASIC[%d] has core num=%d\n",i+1,j,chain_badcore_num[i][j]);
-                                writeInitLogFile(logstr);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        sprintf(logstr,"Chain[J%d] has no core num in PIC\n",i+1);
-                        writeInitLogFile(logstr);
-
-                        for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                            chain_badcore_num[i][j]=0;  // fixed to 0
-                    }
-                }
-                else
-                {
-                    if(chain_pic_buf[((i/3)*3)][0]==FREQ_MAGIC && (!isUseDefaultFreq))
-                    {
-                        sprintf(logstr,"Chain[J%d] has core num in PIC\n",i+1);
-                        writeInitLogFile(logstr);
-
-                        for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                        {
-                            if(j%2)
-                                chain_badcore_num[i][j]=(chain_pic_buf[((i/3)*3)][7+(i%3)*31+22+(j/2)]&0x0f);
-                            else chain_badcore_num[i][j]=(chain_pic_buf[((i/3)*3)][7+(i%3)*31+22+(j/2)]>>4)&0x0f;
-
-                            if(chain_badcore_num[i][j]>0)
-                            {
-                                sprintf(logstr,"Chain[J%d] ASIC[%d] has core num=%d\n",i+1,j,chain_badcore_num[i][j]);
-                                writeInitLogFile(logstr);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        sprintf(logstr,"Chain[J%d] has no core num in PIC\n",i+1);
-                        writeInitLogFile(logstr);
-
-                        for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                            chain_badcore_num[i][j]=0;  // fixed to 0
-                    }
-                }
-#else
-                if(badcore_num_buf[i][0]==BADCORE_MAGIC  && (!isUseDefaultFreq))
-                {
-                    sprintf(logstr,"Chain[J%d] has core num in PIC\n",i+1);
-                    writeInitLogFile(logstr);
-
-                    for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                    {
-                        if(j%2)
-                            chain_badcore_num[i][j]=(badcore_num_buf[i][(j/2)*2+1]&0x0f);
-                        else chain_badcore_num[i][j]=(badcore_num_buf[i][(j/2)*2+1]>>4)&0x0f;
-
-                        if(chain_badcore_num[i][j]>0)
-                        {
-                            sprintf(logstr,"Chain[J%d] ASIC[%d] has core num=%d\n",i+1,j,chain_badcore_num[i][j]);
-                            writeInitLogFile(logstr);
-                        }
-                    }
-                }
-                else
-                {
-                    sprintf(logstr,"Chain[J%d] has no core num in PIC\n",i+1);
-                    writeInitLogFile(logstr);
-
-                    for(j = 0; j < CHAIN_ASIC_NUM; j++)
-                        chain_badcore_num[i][j]=0;  // fixed to 0
-                }
-#endif
-            }
-        }
-        //////////////////////set default freq END////////////////////////////////////////
-
-        if(!isUseDefaultFreq)
-        {
-            sprintf(logstr,"miner total rate=%dGH/s fixed rate=%dGH/s\n",GetTotalRate(),ConvirtTotalRate(GetTotalRate()));
-            writeInitLogFile(logstr);
-        }
-
-        if(!isFixedFreqMode())
-        {
-            //////////////////////// just print freq record, but do not set freq, we need fix freq /////////////////////////
-            for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
-            {
-                chain_max_freq=0;
-                chain_min_freq=100;
-                if(dev->chain_exist[i] == 1 && dev->chain_asic_num[i]>0)
-                {
-                    vol_pic=get_pic_voltage(i);
-                    vol_value = getVolValueFromPICvoltage(vol_pic);
-                    sprintf(logstr,"read PIC voltage=%d on chain[%d]\n",vol_value,i);
-                    writeInitLogFile(logstr);
-
-                    sprintf(logstr,"Chain:%d chipnum=%d\n",i,dev->chain_asic_num[i]);
-                    writeInitLogFile(logstr);
-#ifdef T9_18
-                    if(fpga_version>=0xE)
-                    {
-                        int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                        getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-
-                        sprintf(logstr,"Chain[J%d] voltage added=0.%dV\n",i+1,chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+2]);
-                    }
-                    else
-                    {
-                        sprintf(logstr,"Chain[J%d] voltage added=0.%dV\n",i+1,chain_pic_buf[((i/3)*3)][7+(i%3)*31+2]);
-                    }
-#else
-                    sprintf(logstr,"Chain[J%d] voltage added=0.%dV\n",i+1,last_freq[i][10]&0x3f);
-#endif
-                    writeInitLogFile(logstr);
-
-#ifdef T9_18
-                    if(fpga_version>=0xE)
-                    {
-                        int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                        getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-
-                        hashMAC[0]=chain_pic_buf[new_T9_PLUS_chainIndex][1];
-                        hashMAC[1]=chain_pic_buf[new_T9_PLUS_chainIndex][2];
-                        hashMAC[2]=chain_pic_buf[new_T9_PLUS_chainIndex][3];
-                        hashMAC[3]=chain_pic_buf[new_T9_PLUS_chainIndex][4];
-                        hashMAC[4]=chain_pic_buf[new_T9_PLUS_chainIndex][5];
-                        hashMAC[5]=chain_pic_buf[new_T9_PLUS_chainIndex][6];
-                    }
-                    else
-                    {
-                        hashMAC[0]=chain_pic_buf[((i/3)*3)][1];
-                        hashMAC[1]=chain_pic_buf[((i/3)*3)][2];
-                        hashMAC[2]=chain_pic_buf[((i/3)*3)][3];
-                        hashMAC[3]=chain_pic_buf[((i/3)*3)][4];
-                        hashMAC[4]=chain_pic_buf[((i/3)*3)][5];
-                        hashMAC[5]=chain_pic_buf[((i/3)*3)][6];
-                    }
-#else
-                    hashMAC[0]=((last_freq[i][12]&0x0f)<<4)+(last_freq[i][14]&0x0f);
-                    hashMAC[1]=((last_freq[i][16]&0x0f)<<4)+(last_freq[i][18]&0x0f);
-                    hashMAC[2]=((last_freq[i][20]&0x0f)<<4)+(last_freq[i][22]&0x0f);
-                    hashMAC[3]=((last_freq[i][24]&0x0f)<<4)+(last_freq[i][26]&0x0f);
-                    hashMAC[4]=((last_freq[i][28]&0x0f)<<4)+(last_freq[i][30]&0x0f);
-                    hashMAC[5]=((last_freq[i][32]&0x0f)<<4)+(last_freq[i][34]&0x0f);
-#endif
-                    if(memcmp(hashMAC,minerMAC,6)==0)
-                    {
-                        sprintf(logstr,"OK: Chain[J%d] is for this machine! [minerMAC: %02x:%02x:%02x:%02x:%02x:%02x]\n",i+1,minerMAC[0],minerMAC[1],minerMAC[2],minerMAC[3],minerMAC[4],minerMAC[5]);
-                        writeInitLogFile(logstr);
-                    }
-                    else
-                    {
-                        sprintf(logstr,"Chain[J%d] [minerMAC: %02x:%02x:%02x:%02x:%02x:%02x hashMAC: %02x:%02x:%02x:%02x:%02x:%02x]\n",i+1, minerMAC[0],minerMAC[1],minerMAC[2],minerMAC[3],minerMAC[4],minerMAC[5],hashMAC[0],hashMAC[1],hashMAC[2],hashMAC[3],hashMAC[4],hashMAC[5]);
-                        writeInitLogFile(logstr);
-                    }
-
-#ifdef T9_18
-                    if(fpga_version>=0xE)
-                    {
-                        int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                        getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-
-                        if(isUseDefaultFreq)
-                            base_freq_index[i]=default_freq_index;
-                        else base_freq_index[i]=chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31];
-                        sprintf(logstr,"Chain:%d base freq=%s\n",i,freq_pll_1385[base_freq_index[i]].freq);
-                        writeInitLogFile(logstr);
-
-                        for(j = 0; j < dev->chain_asic_num[i]; j ++)
-                        {
-                            applog(LOG_DEBUG,"%s: freq index=%d\n", __FUNCTION__,chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]);
-
-                            if(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]<MIN_FREQ)
-                                chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]=MIN_FREQ;// error index, set to index of 300M as min
-
-                            if(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j] > MAX_FREQ)
-                                chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]=MAX_FREQ;// error index, set to index of 850M as max
-
-                            if(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j] > max_freq_index)
-                                max_freq_index = chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j];
-
-                            if(chain_max_freq<chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j])
-                                chain_max_freq=chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j];
-
-                            if(chain_min_freq>chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j])
-                                chain_min_freq=chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j];
-
-                            //     set_frequency_with_addr_plldatai(last_freq[i][j*2+3],0, j * dev->addrInterval,i);
-                            sprintf(logstr,"Asic[%2d]:%s ",j,freq_pll_1385[chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]].freq);
-                            writeInitLogFile(logstr);
-                            if ((j % 8) == 0)
-                            {
-                                sprintf(logstr,"\n");
-                                writeInitLogFile(logstr);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if(isUseDefaultFreq)
-                            base_freq_index[i]=default_freq_index;
-                        else base_freq_index[i]=chain_pic_buf[((i/3)*3)][7+(i%3)*31];
-                        sprintf(logstr,"Chain:%d base freq=%s\n",i,freq_pll_1385[base_freq_index[i]].freq);
-                        writeInitLogFile(logstr);
-
-                        for(j = 0; j < dev->chain_asic_num[i]; j ++)
-                        {
-                            applog(LOG_DEBUG,"%s: freq index=%d\n", __FUNCTION__,chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]);
-
-                            if(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]<MIN_FREQ)
-                                chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]=MIN_FREQ;// error index, set to index of 300M as min
-
-                            if(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j] > MAX_FREQ)
-                                chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]=MAX_FREQ;// error index, set to index of 850M as max
-
-                            if(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j] > max_freq_index)
-                                max_freq_index = chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j];
-
-                            if(chain_max_freq<chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j])
-                                chain_max_freq=chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j];
-
-                            if(chain_min_freq>chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j])
-                                chain_min_freq=chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j];
-
-                            //     set_frequency_with_addr_plldatai(last_freq[i][j*2+3],0, j * dev->addrInterval,i);
-                            sprintf(logstr,"Asic[%2d]:%s ",j,freq_pll_1385[chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]].freq);
-                            writeInitLogFile(logstr);
-                            if ((j % 8) == 0)
-                            {
-                                sprintf(logstr,"\n");
-                                writeInitLogFile(logstr);
-                            }
-                        }
-                    }
-#else
-                    pic_temp_offset[i]=((last_freq[i][2]&0x0f)<<4)+(last_freq[i][4]&0x0f);
-                    sprintf(logstr,"Chain:%d temp offset=%d\n",i,(signed char)pic_temp_offset[i]);
-                    writeInitLogFile(logstr);
-
-                    if(isUseDefaultFreq)
-                        base_freq_index[i]=default_freq_index;
-                    else base_freq_index[i]=((last_freq[i][6]&0x0f)<<4)+(last_freq[i][8]&0x0f);
-                    sprintf(logstr,"Chain:%d base freq=%s\n",i,freq_pll_1385[base_freq_index[i]].freq);
-                    writeInitLogFile(logstr);
-
-                    for(j = 0; j < dev->chain_asic_num[i]; j ++)
-                    {
-                        step_down = last_freq[i][0] & 0x3f;
-                        if(step_down == 0x3f)
-                            step_down = 0;
-                        last_freq[i][j*2+3] -=step_down;    // down steps based on the PIC's freq
-
-                        applog(LOG_DEBUG,"%s: freq index=%d\n", __FUNCTION__,last_freq[i][j*2+3]);
-
-                        if(last_freq[i][j*2+3]<MIN_FREQ)
-                            last_freq[i][j*2+3]=MIN_FREQ;// error index, set to index of 300M as min
-
-                        if(last_freq[i][j*2+3] > MAX_FREQ)
-                            last_freq[i][j*2+3]=MAX_FREQ;// error index, set to index of 850M as max
-
-                        if(last_freq[i][j*2+3] > max_freq_index)
-                            max_freq_index = last_freq[i][j*2+3];
-
-                        if(chain_max_freq<last_freq[i][j*2+3])
-                            chain_max_freq=last_freq[i][j*2+3];
-
-                        if(chain_min_freq>last_freq[i][j*2+3])
-                            chain_min_freq=last_freq[i][j*2+3];
-
-                        //     set_frequency_with_addr_plldatai(last_freq[i][j*2+3],0, j * dev->addrInterval,i);
-                        sprintf(logstr,"Asic[%2d]:%s ",j,freq_pll_1385[last_freq[i][j*2+3]].freq);
-                        writeInitLogFile(logstr);
-                        if ((j % 8) == 0)
-                        {
-                            sprintf(logstr,"\n");
-                            writeInitLogFile(logstr);
-                        }
-                    }
-#endif
-                    sprintf(logstr,"\nChain:%d max freq=%s\n",i,freq_pll_1385[chain_max_freq].freq);
-                    writeInitLogFile(logstr);
-                    sprintf(logstr,"Chain:%d min freq=%s\n",i,freq_pll_1385[chain_min_freq].freq);
-                    writeInitLogFile(logstr);
-
-                    sprintf(logstr,"\n");
-                    writeInitLogFile(logstr);
-                }
-            }
-        }
-
-        /////////////////// fix freq and set freq //////////////////////////////////////////
-        max_freq_index = 0;
-        sprintf(logstr,"\nMiner fix freq ...\n");
-        writeInitLogFile(logstr);
-        if((!isUseDefaultFreq) && isChainEnough())
-        {
-            ProcessFixFreqForChips();   //do the real freq fix at first, because this freq is higher than freq showd to users.
-        }
-
-        // always save real freq into chip_last_freq
-        for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
-        {
-            if(dev->chain_exist[i] == 1)
-            {
-#ifdef T9_18
-                memcpy(chip_last_freq[i],chain_pic_buf[i],128);
-#else
-                memcpy(chip_last_freq[i],last_freq[i],256);
-#endif
-            }
-        }
-
-        for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
-        {
-            chain_max_freq=0;
-            chain_min_freq=100;
-            if(dev->chain_exist[i] == 1 && dev->chain_asic_num[i]>0)
-            {
-                vol_pic=get_pic_voltage(i);
-                vol_value = getVolValueFromPICvoltage(vol_pic);
-                sprintf(logstr,"read PIC voltage=%d on chain[%d]\n",vol_value,i);
-                writeInitLogFile(logstr);
-
-                sprintf(logstr,"Chain:%d chipnum=%d\n",i,dev->chain_asic_num[i]);
-                writeInitLogFile(logstr);
-
-                if(!isFixedFreqMode())
-                {
-#ifdef T9_18
-                    if(fpga_version>=0xE)
-                    {
-                        int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                        getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-                        sprintf(logstr,"Chain[J%d] voltage added=0.%dV\n",i+1,chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+2]);
-                    }
-                    else
-                    {
-                        sprintf(logstr,"Chain[J%d] voltage added=0.%dV\n",i+1,chain_pic_buf[((i/3)*3)][7+(i%3)*31+2]);
-                    }
-#else
-                    sprintf(logstr,"Chain[J%d] voltage added=0.%dV\n",i+1,last_freq[i][10]&0x3f);
-#endif
-                    writeInitLogFile(logstr);
-
-#ifdef T9_18
-                    if(fpga_version>=0xE)
-                    {
-                        int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                        getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-
-                        hashMAC[0]=chain_pic_buf[new_T9_PLUS_chainIndex][1];
-                        hashMAC[1]=chain_pic_buf[new_T9_PLUS_chainIndex][2];
-                        hashMAC[2]=chain_pic_buf[new_T9_PLUS_chainIndex][3];
-                        hashMAC[3]=chain_pic_buf[new_T9_PLUS_chainIndex][4];
-                        hashMAC[4]=chain_pic_buf[new_T9_PLUS_chainIndex][5];
-                        hashMAC[5]=chain_pic_buf[new_T9_PLUS_chainIndex][6];
-                    }
-                    else
-                    {
-                        hashMAC[0]=chain_pic_buf[((i/3)*3)][1];
-                        hashMAC[1]=chain_pic_buf[((i/3)*3)][2];
-                        hashMAC[2]=chain_pic_buf[((i/3)*3)][3];
-                        hashMAC[3]=chain_pic_buf[((i/3)*3)][4];
-                        hashMAC[4]=chain_pic_buf[((i/3)*3)][5];
-                        hashMAC[5]=chain_pic_buf[((i/3)*3)][6];
-                    }
-#else
-                    hashMAC[0]=((last_freq[i][12]&0x0f)<<4)+(last_freq[i][14]&0x0f);
-                    hashMAC[1]=((last_freq[i][16]&0x0f)<<4)+(last_freq[i][18]&0x0f);
-                    hashMAC[2]=((last_freq[i][20]&0x0f)<<4)+(last_freq[i][22]&0x0f);
-                    hashMAC[3]=((last_freq[i][24]&0x0f)<<4)+(last_freq[i][26]&0x0f);
-                    hashMAC[4]=((last_freq[i][28]&0x0f)<<4)+(last_freq[i][30]&0x0f);
-                    hashMAC[5]=((last_freq[i][32]&0x0f)<<4)+(last_freq[i][34]&0x0f);
-#endif
-
-                    if(memcmp(hashMAC,minerMAC,6)==0)
-                    {
-                        sprintf(logstr,"OK: Chain[J%d] is for this machine! [minerMAC: %02x:%02x:%02x:%02x:%02x:%02x]\n",i+1,minerMAC[0],minerMAC[1],minerMAC[2],minerMAC[3],minerMAC[4],minerMAC[5]);
-                        writeInitLogFile(logstr);
-                    }
-                    else
-                    {
-                        sprintf(logstr,"Chain[J%d] [minerMAC: %02x:%02x:%02x:%02x:%02x:%02x hashMAC: %02x:%02x:%02x:%02x:%02x:%02x]\n",i+1, minerMAC[0],minerMAC[1],minerMAC[2],minerMAC[3],minerMAC[4],minerMAC[5],hashMAC[0],hashMAC[1],hashMAC[2],hashMAC[3],hashMAC[4],hashMAC[5]);
-                        writeInitLogFile(logstr);
-                    }
-                }
-
-#ifdef T9_18
-                if(fpga_version>=0xE)
-                {
-                    int new_T9_PLUS_chainIndex,new_T9_PLUS_chainOffset;
-                    getPICChainIndexOffset(i,&new_T9_PLUS_chainIndex,&new_T9_PLUS_chainOffset);
-
-                    if(!isFixedFreqMode())
-                    {
-                        if(isUseDefaultFreq)
-                            base_freq_index[i]=default_freq_index;
-                        else base_freq_index[i]=chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31];
-                        sprintf(logstr,"Chain:%d base freq=%s\n",i,freq_pll_1385[base_freq_index[i]].freq);
-                        writeInitLogFile(logstr);
-                    }
-                    for(j = 0; j < dev->chain_asic_num[i]; j ++)
-                    {
-                        applog(LOG_DEBUG,"%s: freq index=%d\n", __FUNCTION__,chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]);
-
-                        if(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]<MIN_FREQ)
-                            chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]=MIN_FREQ;// error index, set to index of 300M as min
-
-                        if(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j] > MAX_FREQ)
-                            chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]=MAX_FREQ;// error index, set to index of 850M as max
-
-                        if(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j] > max_freq_index)
-                            max_freq_index = chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j];
-
-                        if(chain_max_freq<chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j])
-                            chain_max_freq=chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j];
-
-                        if(chain_min_freq>chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j])
-                            chain_min_freq=chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j];
-
-                        if(isFixedFreqMode())   // when use fixed freq, we add more 1 step on freq index
-                            //set_frequency_with_addr_plldatai(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]+1, 0, j * dev->addrInterval, i);
-                            set_frequency_with_addr_plldatai(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j], 0, j * dev->addrInterval, i);
-                        else
-                            set_frequency_with_addr_plldatai(chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j], 0, j * dev->addrInterval, i);
-
-                        sprintf(logstr,"Asic[%2d]:%s ",j,freq_pll_1385[chain_pic_buf[new_T9_PLUS_chainIndex][7+new_T9_PLUS_chainOffset*31+4+j]].freq);
-                        writeInitLogFile(logstr);
-
-                        if ((j % 8) == 0)
-                        {
-                            sprintf(logstr,"\n");
-                            writeInitLogFile(logstr);
-                        }
-                    }
-
-                }
-                else
-                {
-                    if(!isFixedFreqMode())
-                    {
-                        if(isUseDefaultFreq)
-                            base_freq_index[i]=default_freq_index;
-                        else base_freq_index[i]=chain_pic_buf[((i/3)*3)][7+(i%3)*31];
-                        sprintf(logstr,"Chain:%d base freq=%s\n",i,freq_pll_1385[base_freq_index[i]].freq);
-                        writeInitLogFile(logstr);
-                    }
-                    for(j = 0; j < dev->chain_asic_num[i]; j ++)
-                    {
-                        applog(LOG_DEBUG,"%s: freq index=%d\n", __FUNCTION__,chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]);
-
-                        if(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]<MIN_FREQ)
-                            chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]=MIN_FREQ;// error index, set to index of 300M as min
-
-                        if(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j] > MAX_FREQ)
-                            chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]=MAX_FREQ;// error index, set to index of 850M as max
-
-                        if(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j] > max_freq_index)
-                            max_freq_index = chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j];
-
-                        if(chain_max_freq<chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j])
-                            chain_max_freq=chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j];
-
-                        if(chain_min_freq>chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j])
-                            chain_min_freq=chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j];
-
-                        if(isFixedFreqMode())   // when use fixed freq, we add more 1 step on freq index
-                            //set_frequency_with_addr_plldatai(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]+1, 0, j * dev->addrInterval, i);
-                            set_frequency_with_addr_plldatai(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j], 0, j * dev->addrInterval, i);
-                        else
-                            set_frequency_with_addr_plldatai(chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j], 0, j * dev->addrInterval, i);
-
-                        sprintf(logstr,"Asic[%2d]:%s ",j,freq_pll_1385[chain_pic_buf[((i/3)*3)][7+(i%3)*31+4+j]].freq);
-                        writeInitLogFile(logstr);
-
-                        if ((j % 8) == 0)
-                        {
-                            sprintf(logstr,"\n");
-                            writeInitLogFile(logstr);
-                        }
-                    }
-                }
-#else
-                if(!isFixedFreqMode())
-                {
-                    pic_temp_offset[i]=((last_freq[i][2]&0x0f)<<4)+(last_freq[i][4]&0x0f);
-                    sprintf(logstr,"Chain:%d temp offset=%d\n",i,(signed char)pic_temp_offset[i]);
-                    writeInitLogFile(logstr);
-
-                    if(isUseDefaultFreq)
-                        base_freq_index[i]=default_freq_index;
-                    else base_freq_index[i]=((last_freq[i][6]&0x0f)<<4)+(last_freq[i][8]&0x0f);
-                    sprintf(logstr,"Chain:%d base freq=%s\n",i,freq_pll_1385[base_freq_index[i]].freq);
-                    writeInitLogFile(logstr);
-                }
-
-                for(j = 0; j < dev->chain_asic_num[i]; j ++)
-                {
-                    if(!isFixedFreqMode())
-                    {
-                        step_down = last_freq[i][0] & 0x3f;
-                        if(step_down == 0x3f)
-                            step_down = 0;
-                        last_freq[i][j*2+3] -=step_down;    // down some steps based on the PIC's freq,  now NOT USED!!!
-                    }
-
-                    applog(LOG_DEBUG,"%s: freq index=%d\n", __FUNCTION__,last_freq[i][j*2+3]);
-
-                    if(last_freq[i][j*2+3]<MIN_FREQ)
-                        last_freq[i][j*2+3]=MIN_FREQ;// error index, set to index of 300M as min
-
-                    if(last_freq[i][j*2+3] > MAX_FREQ)
-                        last_freq[i][j*2+3]=MAX_FREQ;// error index, set to index of 850M as max
-
-                    if(last_freq[i][j*2+3] > max_freq_index)
-                        max_freq_index = last_freq[i][j*2+3];
-
-                    if(chain_max_freq<last_freq[i][j*2+3])
-                        chain_max_freq=last_freq[i][j*2+3];
-
-                    if(chain_min_freq>last_freq[i][j*2+3])
-                        chain_min_freq=last_freq[i][j*2+3];
-
-                    if(isFixedFreqMode())   // when use fixed freq, we add more 1 step on freq index
-                        //set_frequency_with_addr_plldatai(last_freq[i][j*2+3]+1,0, j * dev->addrInterval,i);
-                        set_frequency_with_addr_plldatai(last_freq[i][j*2+3],0, j * dev->addrInterval,i);
-                    else
-                        set_frequency_with_addr_plldatai(last_freq[i][j*2+3],0, j * dev->addrInterval,i);
-
-                    sprintf(logstr,"Asic[%2d]:%s ",j,freq_pll_1385[last_freq[i][j*2+3]].freq);
-                    writeInitLogFile(logstr);
-
-                    if ((j % 8) == 0)
-                    {
-                        sprintf(logstr,"\n");
-                        writeInitLogFile(logstr);
-                    }
-                }
-#endif
-
-                sprintf(logstr,"\nChain:%d max freq=%s\n",i,freq_pll_1385[chain_max_freq].freq);
-                writeInitLogFile(logstr);
-                sprintf(logstr,"Chain:%d min freq=%s\n",i,freq_pll_1385[chain_min_freq].freq);
-                writeInitLogFile(logstr);
-
-                sprintf(logstr,"\n");
-                writeInitLogFile(logstr);
-            }
-        }
-
-        value = atoi(freq_pll_1385[max_freq_index].freq);
-        dev->frequency = value;
-        sprintf(logstr,"max freq = %d\n",dev->frequency);
-        writeInitLogFile(logstr);
-
-        if(!isUseDefaultFreq)
-        {
-            ProcessFixFreq();
-        }
-
-        // always save freq showd to user, into show_last_freq, because the real freq is up 5% when in user mode.
-        for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
-        {
-            if(dev->chain_exist[i] == 1)
-            {
-#ifdef T9_18
-                memcpy(show_last_freq[i],chain_pic_buf[i],128);
-#else
-                memcpy(show_last_freq[i],last_freq[i],256);
-#endif
-            }
-        }
-
-#ifdef DISABLE_TEMP_PROTECT
-        sprintf(logstr,"\nAttention: Temp Protect Disabled! Debug Mode\n\n");
-        writeInitLogFile(logstr);
-#endif
-    }
-
-    void set_frequency_with_addr(unsigned short int frequency,unsigned char mode,unsigned char addr, unsigned char chain)
-    {
-        unsigned char buf[9] = {0,0,0,0,0,0,0,0,0};
-        unsigned int cmd_buf[3] = {0,0,0};
+int set_frequency(int chain_id, int requested_freq)
+{
+	int freq_index;
+	int freq;
+	int j;
+
+	/* sanity checks */
+	assert(dev->chain_exist[chain_id] == 1);
+	assert(dev->chain_asic_num[chain_id] > 0);
+
+	/* look-up frequency and clamp it if neccessary */
+	freq_index = get_pll_index_clamp(requested_freq);
+	freq = get_freqvalue_by_index(freq_index);
+
+        applog(LOG_NOTICE, "%s: chain_id=%d frequency %d MHz (index %d, was converted from %d)",
+		__FUNCTION__, chain_id, freq, freq_index, requested_freq);
+
+	/* fill-in tables (not sure if the data are used, remove me otherwise) */
+	last_freq[chain_id][0]=0;
+	last_freq[chain_id][1]=FREQ_MAGIC;
+
+	for (j = 0; j < CHAIN_ASIC_NUM; j++) {
+		last_freq[chain_id][j*2 + 2] = 0;
+		last_freq[chain_id][j*2 + 3] = freq_index;
+		chain_badcore_num[chain_id][j] = 0;
+	}
+	memcpy(show_last_freq[chain_id], last_freq[chain_id], 256);
+	memcpy(chip_last_freq[chain_id], last_freq[chain_id], 256);
+
+	/* call the HW and set frequency */
+	for (j = 0; j < CHAIN_ASIC_NUM; j++) {
+		set_frequency_with_addr_plldatai(freq_index, 0, j * dev->addrInterval, chain_id);
+	}
+
+        /* remember what frequency was set */
+        chain_frequency_value[chain_id] = freq;
+
+	return freq;
+}
+
+void set_frequency_all_chains(int requested_freq)
+{
+	int i;
+
+	/* set frequency on each existing chain */
+	for (i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++) {
+		if (dev->chain_exist[i] == 1 && dev->chain_asic_num[i] > 0) {
+			set_frequency(i, requested_freq);
+		}
+	}
+}
+
+int get_min_frequency(void)
+{
         int i;
-        unsigned int ret, value;
-        uint32_t reg_data_pll = 0;
-        uint16_t reg_data_pll2 = 0;
-        uint32_t reg_data_vil = 0;
-        i = chain;
-
-        applog(LOG_DEBUG,"\n--- %s\n", __FUNCTION__);
-
-        get_plldata(1385, frequency, &reg_data_pll, &reg_data_pll2, &reg_data_vil);
-        applog(LOG_DEBUG,"%s: frequency = %d\n", __FUNCTION__, frequency);
-
-        //applog(LOG_DEBUG,"%s: i = %d\n", __FUNCTION__, i);
-        if(!opt_multi_version)  // fil mode
-        {
-            memset(buf,0,sizeof(buf));
-            memset(cmd_buf,0,sizeof(cmd_buf));
-            buf[0] = 0;
-            buf[0] |= SET_PLL_DIVIDER1;
-            buf[1] = (reg_data_pll >> 16) & 0xff;
-            buf[2] = (reg_data_pll >> 8) & 0xff;
-            buf[3] = (reg_data_pll >> 0) & 0xff;
-            buf[3] |= CRC5(buf, 4*8 - 5);
-            cmd_buf[0] = buf[0]<<24 | buf[1]<<16 | buf[2]<<8 | buf[3];
-
-            set_BC_command_buffer(cmd_buf);
-            ret = get_BC_write_command();
-            value = BC_COMMAND_BUFFER_READY | BC_COMMAND_EN_CHAIN_ID| (i << 16) | (ret & 0xfff0ffff);
-            set_BC_write_command(value);
-
-            cgsleep_us(3000);
-
-            memset(buf,0,sizeof(buf));
-            memset(cmd_buf,0,sizeof(cmd_buf));
-            buf[0] = SET_PLL_DIVIDER2;
-            buf[0] |= COMMAND_FOR_ALL;
-            buf[1] = 0;     //addr
-            buf[2] = reg_data_pll2 >> 8;
-            buf[3] = reg_data_pll2& 0x0ff;
-            buf[3] |= CRC5(buf, 4*8 - 5);
-            cmd_buf[0] = buf[0]<<24 | buf[1]<<16 | buf[2]<<8 | buf[3];
-
-            set_BC_command_buffer(cmd_buf);
-            ret = get_BC_write_command();
-            value = BC_COMMAND_BUFFER_READY | BC_COMMAND_EN_CHAIN_ID| (i << 16) | (ret & 0xfff0ffff);
-            set_BC_write_command(value);
-
-            dev->freq[i] = frequency;
-
-            cgsleep_us(5000);
-        }
-        else    // vil
-        {
-            memset(buf,0,9);
-            memset(cmd_buf,0,3*sizeof(int));
-            if(mode)
-                buf[0] = VIL_COMMAND_TYPE | VIL_ALL | SET_CONFIG;
-            else
-                buf[0] = VIL_COMMAND_TYPE | SET_CONFIG;
-            buf[1] = 0x09;
-            buf[2] = addr;
-            buf[3] = PLL_PARAMETER;
-            buf[4] = (reg_data_vil >> 24) & 0xff;
-            buf[5] = (reg_data_vil >> 16) & 0xff;
-            buf[6] = (reg_data_vil >> 8) & 0xff;
-            buf[7] = (reg_data_vil >> 0) & 0xff;
-            buf[8] = CRC5(buf, 8*8);
-
-            cmd_buf[0] = buf[0]<<24 | buf[1]<<16 | buf[2]<<8 | buf[3];
-            cmd_buf[1] = buf[4]<<24 | buf[5]<<16 | buf[6]<<8 | buf[7];;
-            cmd_buf[2] = buf[8]<<24;
-
-            set_BC_command_buffer(cmd_buf);
-            ret = get_BC_write_command();
-            value = BC_COMMAND_BUFFER_READY | BC_COMMAND_EN_CHAIN_ID| (i << 16) | (ret & 0xfff0ffff);
-            set_BC_write_command(value);
-
-            dev->freq[i] = frequency;
-            cgsleep_us(10000);
-        }
-    }
+        int min_freq = MAX_FREQ;
+	for (i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++) {
+		if (dev->chain_exist[i] == 1 && dev->chain_asic_num[i] > 0) {
+                        int freq = chain_frequency_value[i];
+                        if (freq < min_freq)
+                                min_freq = freq;
+		}
+	}
+        return min_freq;
+}
 
 
     void clear_nonce_fifo()
@@ -5963,7 +5247,9 @@ void set_Hardware_version(unsigned int value)
             fclose(fd);
         }
 //  updateLogFile();
-//  printf(logstr);
+#ifdef DEBUG_LOG
+        printf(logstr);
+#endif
     }
 
     void updateLogFile()
@@ -5975,7 +5261,7 @@ void set_Hardware_version(unsigned int value)
     {
         FILE *fd;
         char testnumStr[32];
-        fd=fopen("/etc/config/testID","wb");
+        fd=fopen("/etc/bmminer/testID","wb");
         if(fd)
         {
             memset(testnumStr,'\0',sizeof(testnumStr));
@@ -5988,7 +5274,7 @@ void set_Hardware_version(unsigned int value)
     {
         FILE *fd;
         char testnumStr[32];
-        fd=fopen("/etc/config/testID","rb");
+        fd=fopen("/etc/bmminer/testID","rb");
         if(fd)
         {
             memset(testnumStr,'\0',sizeof(testnumStr));
@@ -6341,7 +5627,7 @@ void set_Hardware_version(unsigned int value)
         if(config_parameter.frequency_eft)
         {
             dev->frequency = config_parameter.frequency;
-            set_frequency(dev->frequency);
+            set_frequency_all_chains(dev->frequency);
             sprintf(dev->frequency_t,"%u",dev->frequency);
         }
 
@@ -7840,6 +7126,7 @@ void set_Hardware_version(unsigned int value)
         set_baud(bauddiv,1);
     }
 
+#if 0
 #ifdef DEBUG_PRINT_T9_PLUS_PIC_HEART_INFO
     void set_red_led(bool flag)
     {
@@ -7918,6 +7205,10 @@ void set_Hardware_version(unsigned int value)
             }
         }
     }
+#else
+    void set_red_led(bool flag) {}
+    void set_led(bool stop) {}
+#endif
 
     void * pic_heart_beat_func()
     {
@@ -8044,7 +7335,7 @@ void set_Hardware_version(unsigned int value)
     {
         FILE *fd;
         char testnumStr[32];
-        fd=fopen("/etc/config/rebootTest","wb");
+        fd=fopen("/etc/bmminer/rebootTest","wb");
         if(fd)
         {
             memset(testnumStr,'\0',sizeof(testnumStr));
@@ -8061,7 +7352,7 @@ void set_Hardware_version(unsigned int value)
 #else
         FILE *fd;
         char testnumStr[32];
-        fd=fopen("/etc/config/rebootTest","rb");
+        fd=fopen("/etc/bmminer/rebootTest","rb");
         if(fd)
         {
             memset(testnumStr,'\0',sizeof(testnumStr));
@@ -8078,7 +7369,7 @@ void set_Hardware_version(unsigned int value)
     {
         FILE *fd;
         char testnumStr[32];
-        fd=fopen("/etc/config/restartTest","wb");
+        fd=fopen("/etc/bmminer/restartTest","wb");
         if(fd)
         {
             memset(testnumStr,'\0',sizeof(testnumStr));
@@ -8095,7 +7386,7 @@ void set_Hardware_version(unsigned int value)
 #else
         FILE *fd;
         char testnumStr[32];
-        fd=fopen("/etc/config/restartTest","rb");
+        fd=fopen("/etc/bmminer/restartTest","rb");
         if(fd)
         {
             memset(testnumStr,'\0',sizeof(testnumStr));
@@ -8304,7 +7595,7 @@ void set_Hardware_version(unsigned int value)
                 {
                     char error_info[256];
                     // keep the log , we can check it
-                    system("cp /tmp/search /etc/config/lastlog -f");
+                    system("cp /tmp/search /etc/bmminer/lastlog -f");
 
                     saveRebootTestNum(3333);    // 3333 is magic number inform that this miner failed on test !
                     rebootTestNum=3333;
@@ -9303,22 +8594,22 @@ void set_Hardware_version(unsigned int value)
                                 {
                                     nonce_read_out.nonce_buffer[nonce_read_out.p_wr].midstate[m]  = *((unsigned char *)data_addr + MIDSTATE_OFFSET + m);
                                 }
+#ifdef DEBUG_LOG
+                                applog(LOG_DEBUG,"%s: buf[0] = 0x%x\n", __FUNCTION__, buf[0]);
+                                applog(LOG_DEBUG,"%s: work_id = 0x%x\n", __FUNCTION__, work_id);
+                                applog(LOG_DEBUG,"%s: nonce2_jobid_address = 0x%x\n", __FUNCTION__, nonce2_jobid_address);
+                                applog(LOG_DEBUG,"%s: data_addr = 0x%x\n", __FUNCTION__, data_addr);
+                                applog(LOG_DEBUG,"%s: nonce3 = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].nonce3);
+                                applog(LOG_DEBUG,"%s: job_id = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].job_id);
+                                applog(LOG_DEBUG,"%s: header_version = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].header_version);
+                                applog(LOG_DEBUG,"%s: nonce2 = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].nonce2);
 
-                                //applog(LOG_DEBUG,"%s: buf[0] = 0x%x\n", __FUNCTION__, buf[0]);
-                                //applog(LOG_DEBUG,"%s: work_id = 0x%x\n", __FUNCTION__, work_id);
-                                //applog(LOG_DEBUG,"%s: nonce2_jobid_address = 0x%x\n", __FUNCTION__, nonce2_jobid_address);
-                                //applog(LOG_DEBUG,"%s: data_addr = 0x%x\n", __FUNCTION__, data_addr);
-                                //applog(LOG_DEBUG,"%s: nonce3 = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].nonce3);
-                                //applog(LOG_DEBUG,"%s: job_id = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].job_id);
-                                //applog(LOG_DEBUG,"%s: header_version = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].header_version);
-                                //applog(LOG_DEBUG,"%s: nonce2 = 0x%x\n", __FUNCTION__, nonce_read_out.nonce_buffer[nonce_read_out.p_wr].nonce2);
+                                buf_hex = bin2hex(nonce_read_out.nonce_buffer[nonce_read_out.p_wr].midstate,32);
 
-                                //buf_hex = bin2hex(nonce_read_out.nonce_buffer[nonce_read_out.p_wr].midstate,32);
+                                applog(LOG_DEBUG,"%s: midstate: %s\n", __FUNCTION__, buf_hex);
 
-                                //applog(LOG_DEBUG,"%s: midstate: %s\n", __FUNCTION__, buf_hex);
-
-                                //free(buf_hex);
-
+                                free(buf_hex);
+#endif
 
                                 if(nonce_read_out.p_wr < MAX_NONCE_NUMBER_IN_FIFO)
                                 {
@@ -9685,7 +8976,7 @@ void set_Hardware_version(unsigned int value)
         if(config_parameter.frequency_eft)
         {
             dev->frequency = config_parameter.frequency;
-            set_frequency(dev->frequency);
+            set_frequency_all_chains(dev->frequency);
             sprintf(dev->frequency_t,"%u",dev->frequency);
         }
 
@@ -10333,16 +9624,25 @@ void set_Hardware_version(unsigned int value)
 
         if(isFixedFreqMode())
         {
-            // we must set voltage value according to the freq of config file!
+            int chain_id = 0;
+
             for(i=0; i < BITMAIN_MAX_CHAIN_NUM; i++)
             {
                 if(dev->chain_exist[i] == 1)
                 {
-                    chain_voltage_value[i] = getFixedFreqVoltageValue(config_parameter.frequency);
-                    chain_voltage_pic[i] = getPICvoltageFromValue(chain_voltage_value[i]);
+                    int freq = normalize_freq_clamp(chain_frequency_settings[chain_id]);
+                    int vol = getFixedFreqVoltageValue(freq);
 
-                    sprintf(logstr,"Fix freq=%d Chain[%d] voltage_pic=%d value=%d\n",config_parameter.frequency,i,chain_voltage_pic[i],chain_voltage_value[i]);
-                    writeInitLogFile(logstr);
+                    int set_vol = chain_voltage_settings[chain_id];
+                    if (set_vol != 0) {
+                        applog(LOG_NOTICE,"chain %d: overriding global voltage from default %.2lfV to %.2lfV",
+                                    i, vol / 100.0, set_vol/ 100.0);
+                        vol = set_vol;
+                    }
+
+                    chain_voltage_value[i] = vol;
+                    chain_voltage_pic[i] = getPICvoltageFromValue(chain_voltage_value[i]);
+                    chain_id++;
                 }
             }
         }
@@ -10540,11 +9840,21 @@ void set_Hardware_version(unsigned int value)
 //    check_asic_reg(CHIP_ADDRESS);
 //    cgsleep_ms(10);
 
-        if(config_parameter.frequency_eft)
-        {
-            dev->frequency = config_parameter.frequency;
-            set_frequency(dev->frequency);
-            sprintf(dev->frequency_t,"%u",dev->frequency);
+        if (config_parameter.frequency_eft) {
+		int chain_id = 0;
+
+		for (i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++) {
+			if (dev->chain_exist[i] == 1) {
+				int freq = chain_frequency_settings[chain_id];
+
+				/* this configures the hardware */
+				set_frequency(i, freq);
+
+				chain_id++;
+			}
+		}
+                dev->frequency = get_min_frequency();
+		sprintf(dev->frequency_t,"%u",dev->frequency);
         }
 
         cgsleep_ms(10);
@@ -11475,6 +10785,12 @@ void set_Hardware_version(unsigned int value)
         struct cgpu_info *bitmain_c5 = thr->cgpu;
         struct bitmain_c5_info *info = bitmain_c5->device_data;
 
+	if (opt_fixed_freq != true)
+		quit(1, "Mining in non-fixed-freq mode is not supported, use --fixed-freq");
+
+#ifdef DEBUG_LOG
+        printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
         info->thr = thr;
         mutex_init(&info->lock);
         cglock_init(&info->update_lock);
@@ -11504,8 +10820,8 @@ void set_Hardware_version(unsigned int value)
             .asic_num                       = 54,
             .fan_pwm_percent                = opt_bitmain_fan_pwm,
             .temperature                    = 80,
-            .frequency                      = opt_bitmain_c5_freq,
-            .voltage                        = {0x07,0x25},
+            .frequency                      = 0,
+            .voltage                        = {0},
             .chain_check_time_integer       = 10,
             .chain_check_time_fractions     = 10,
             .timeout_data_integer           = 0,
@@ -11536,7 +10852,9 @@ void set_Hardware_version(unsigned int value)
         struct cgpu_info *cgpu = calloc(1, sizeof(*cgpu));
         struct device_drv *drv = &bitmain_c5_drv;
         struct bitmain_c5_info *a;
-
+#ifdef DEBUG_LOG
+        printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
         assert(cgpu);
         cgpu->drv = drv;
         cgpu->deven = DEV_ENABLED;
@@ -11673,6 +10991,7 @@ void set_Hardware_version(unsigned int value)
                     }
                 }
 #ifndef CAPTURE_PATTEN
+		work->chain_id = chain_id;
                 submit_nonce(thr, work, nonce); // clement disable it , do not submit to pool
 #endif
             }
@@ -11741,6 +11060,9 @@ void set_Hardware_version(unsigned int value)
             {
                 if(dev->chain_exist[chain_id] == 1)
                 {
+#ifdef DEBUG_LOG
+                    printf("!!! %s:%d: HW error\n", __FUNCTION__, __LINE__);
+#endif
                     inc_hw_errors(thr);
                     dev->chain_hw[chain_id]++;
                 }
@@ -11753,6 +11075,9 @@ void set_Hardware_version(unsigned int value)
                 applog(LOG_DEBUG,"%s: job_id error ...\n", __FUNCTION__);
                 if(dev->chain_exist[chain_id] == 1)
                 {
+#ifdef DEBUG_LOG
+                    printf("!!! %s:%d: HW error\n", __FUNCTION__, __LINE__);
+#endif
                     inc_hw_errors(thr);
                     dev->chain_hw[chain_id]++;
                 }
@@ -11776,6 +11101,9 @@ void set_Hardware_version(unsigned int value)
                     applog(LOG_DEBUG,"%s: job_id non't found ...\n", __FUNCTION__);
                     if(dev->chain_exist[chain_id] == 1)
                     {
+#ifdef DEBUG_LOG
+                        printf("!!! %s:%d: HW error (%d - %d, %p, %p, %p)\n", __FUNCTION__, __LINE__, given_id, job_id, pool_stratum0, pool_stratum1, pool_stratum2);
+#endif
                         inc_hw_errors(thr);
                         dev->chain_hw[chain_id]++;
                     }
@@ -11798,6 +11126,9 @@ void set_Hardware_version(unsigned int value)
 
     static int64_t bitmain_c5_scanhash(struct thr_info *thr)
     {
+#ifdef DEBUG_LOG
+        // printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
         h = 0;
         pthread_t send_id;
         pthread_create(&send_id, NULL, bitmain_scanhash, thr);
@@ -11816,6 +11147,9 @@ void set_Hardware_version(unsigned int value)
         static char *last_job = NULL;
         bool same_job = true;
         unsigned char *buf = NULL;
+#ifdef DEBUG_LOG
+        printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
         thr->work_update = false;
         thr->work_restart = false;
         /* Step 1: Make sure pool is ready */
@@ -11825,6 +11159,9 @@ void set_Hardware_version(unsigned int value)
         pool = current_pool();
         if (!pool->has_stratum)
             quit(1, "Bitmain S9 has to use stratum pools");
+
+        if (opt_multi_version > 1 && !pool->supports_version_rolling)
+            quit(1, "Requested multi-version=%d, but pool doesn't support version rolling!", opt_multi_version);
 
         /* Step 3: Parse job to c5 formart */
         cg_wlock(&info->update_lock);
@@ -11855,6 +11192,9 @@ void set_Hardware_version(unsigned int value)
     static void get_bitmain_statline_before(char *buf, size_t bufsiz, struct cgpu_info *bitmain_c5)
     {
         struct bitmain_c5_info *info = bitmain_c5->device_data;
+#ifdef DEBUG_LOG
+        printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
     }
 
     void remove_dot_char(char *number)
@@ -11902,7 +11242,9 @@ void set_Hardware_version(unsigned int value)
         uint64_t hash_rate_all = 0;
         char displayed_rate_all[16];
         bool copy_data = true;
-
+#ifdef DEBUG_LOG
+        printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
         root = api_add_uint8(root, "miner_count", &(dev->chain_num), copy_data);
         root = api_add_string(root, "frequency", dev->frequency_t, copy_data);
         root = api_add_uint8(root, "fan_num", &(dev->fan_num), copy_data);
@@ -12331,6 +11673,9 @@ void set_Hardware_version(unsigned int value)
     static void bitmain_c5_shutdown(struct thr_info *thr)
     {
         unsigned int ret;
+#ifdef DEBUG_LOG
+        printf("!!! %s:%d\n", __FUNCTION__, __LINE__);
+#endif
         thr_info_cancel(check_system_work_id);
         thr_info_cancel(read_nonce_reg_id);
         thr_info_cancel(read_temp_id);

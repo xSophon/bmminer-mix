@@ -111,6 +111,7 @@
 #define MAX_BAUD_DIVIDER        26
 #define DEFAULT_BAUD_DIVIDER    26
 #define VIL_COMMAND_TYPE        (0x02 << 5)
+//! Command is sent to all chips
 #define VIL_ALL                 (0x01 << 4)
 #define PAT                     (0x01 << 7)
 #define GRAY                    (0x01 << 6)
@@ -212,12 +213,14 @@
 #define PHY_MEM_NONCE2_JOBID_ADDRESS_XILINX_1GB         ((1024-16)*1024*1024)
 #define PHY_MEM_NONCE2_JOBID_ADDRESS_XILINX_512MB       ((512-16)*1024*1024)        // XILINX use 512MB memory
 #define PHY_MEM_NONCE2_JOBID_ADDRESS_XILINX_256MB       ((256-16)*1024*1024)        // XILINX use 512MB memory
-
 #define PHY_MEM_NONCE2_JOBID_ADDRESS_C5         ((1024-16)*1024*1024)
 extern unsigned int PHY_MEM_NONCE2_JOBID_ADDRESS;
 
 #define PHY_MEM_JOB_START_ADDRESS_1     (PHY_MEM_NONCE2_JOBID_ADDRESS + NONCE2_AND_JOBID_STORE_SPACE)
 #define PHY_MEM_JOB_START_ADDRESS_2     (PHY_MEM_JOB_START_ADDRESS_1 + JOB_STORE_SPACE)
+
+// Base address of the FPGA control interface connected via AXI bus
+#define AXI_FPGA_BASE_ADDRESS_XILINX    0x43c00000
 
 #include "miner_type.h"     // use setminertype to define miner type in this file instead of belows!!!
 //#define R4        // if defined , for R4  63 chips
@@ -508,8 +511,11 @@ extern int MAX_FAN_PCB_TEMP;
 
 #define MAX_TEMPCHIP_NUM        8   // support 8 chip has temp
 
-#define MIN_FREQ                4   // 8:300M   6:250M      4:200M
-#define MAX_FREQ                100 //850M
+#define MIN_FREQ		200
+#define MAX_FREQ		850
+#define MIN_FREQ_INDEX          get_pll_index(MIN_FREQ)
+#define MAX_FREQ_INDEX          get_pll_index(MAX_FREQ)
+#define DEFAULT_FREQ		600
 #define MAX_SW_TEMP_OFFSET      -15
 #define BMMINER_VERSION         3   // 3 for auto freq,  1 or 2 for normal ( the old version is 0)
 
@@ -518,14 +524,14 @@ extern int MAX_FAN_PCB_TEMP;
 #define GREEN_LED_DEV_C5 "/sys/class/leds/hps_led0/brightness"
 
 // for xilinx, bmminer will detect board type and use it.
-#define RED_LED_DEV_XILINX "/sys/class/gpio/gpio37/value"
-#define GREEN_LED_DEV_XILINX "/sys/class/gpio/gpio38/value"
+#define RED_LED_DEV_XILINX "/sys/class/gpio/gpio943/value"
+#define GREEN_LED_DEV_XILINX "/sys/class/gpio/gpio944/value"
 
 // S9 , T9,  R4    PIC PROGRAM
-#define PIC_PROGRAM "/etc/config/hash_s8_app.txt"
+#define PIC_PROGRAM "/etc/bmminer/hash_s8_app.txt"
 
 // T9+  PIC PROGRAM
-#define DSPIC33EP16GS202_PIC_PROGRAM "/etc/config/dsPIC33EP16GS202_app.txt"
+#define DSPIC33EP16GS202_PIC_PROGRAM "/etc/bmminer/dsPIC33EP16GS202_app.txt"
 
 
 #define TIMESLICE 60
@@ -903,12 +909,23 @@ extern bool opt_bitmain_new_cmd_type_vil;
 extern bool opt_fixed_freq;
 extern bool opt_pre_heat;
 extern int opt_bitmain_fan_pwm;
-extern int opt_bitmain_c5_freq;
-extern int opt_bitmain_c5_voltage;
 extern int ADD_FREQ;
 extern int ADD_FREQ1;
 extern int fpga_version;
 
+extern struct all_parameters *dev;
+extern char displayed_rate[BITMAIN_MAX_CHAIN_NUM][32];
+extern unsigned char last_freq[BITMAIN_MAX_CHAIN_NUM][256];
+extern int chain_badcore_num[BITMAIN_MAX_CHAIN_NUM][256];
+
+extern int get_pll_index(int freq);
+
+extern uint32_t g_accepted[BITMAIN_MAX_CHAIN_NUM];
+extern uint32_t g_rejected[BITMAIN_MAX_CHAIN_NUM];
+
+extern int chain_voltage_settings[BITMAIN_MAX_CHAIN_NUM];
+extern int chain_frequency_settings[BITMAIN_MAX_CHAIN_NUM];
+
+int getVolValueFromPICvoltage(unsigned char vol_pic);
 
 #endif
-

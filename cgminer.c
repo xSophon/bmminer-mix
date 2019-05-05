@@ -60,6 +60,7 @@ char *curly = ":D";
 #include "compat.h"
 #include "miner.h"
 #include "bench_block.h"
+#include "construct.h"
 
 #ifdef USE_BITMAIN
 #include "driver-bitmain.h"
@@ -734,7 +735,7 @@ struct pool *add_pool(void)
     pool = cgcalloc(sizeof(struct pool), (size_t)1);
 
 #ifdef USE_BITMAIN_C5
-    pool->support_vil = false; // TODO: why does S9 not support vil mode?
+    pool->supports_version_rolling = false;
 #endif
 
     if (!pool)
@@ -921,6 +922,88 @@ static char *set_int_1_to_10(const char *arg, int *i)
 static char __maybe_unused *set_int_0_to_4(const char *arg, int *i)
 {
     return set_int_range(arg, i, 0, 4);
+}
+
+static int parse_list(char *s, char **argv, int max_argc, char sep)
+{
+	int argc = 0;
+
+	if (!*s)
+		return 0;
+	while (argc < max_argc) {
+		argv[argc++] = s;
+		while (*s != sep) {
+			if (!*s)
+				goto done;
+			s++;
+		}
+		*s++ = 0;
+	}
+done:
+	return argc;
+}
+
+static const char *parse_optlist(const char *arg, int *out, int out_size, const char *(*fn)(const char *s, int *ret))
+{
+	char *list = strdupa(arg);
+	int argc;
+	char *argv[out_size];
+
+	/* parse list and fold errors */
+	argc = parse_list(list, argv, ARRAY_SIZE(argv), ',');
+	for (int i = 0; i < argc; i++) {
+		const char *s = argv[i];
+
+		/* if "s" is empty, leave "default" */
+		if (strlen(s) > 0) {
+			const char *err = fn(s, &out[i]);
+			if (err)
+				return err;
+		}
+	}
+	/* if only one argument was passed, copy it to the rest */
+	if (argc == 1) {
+		for (int i = 1; i < out_size; i++) {
+			out[i] = out[0];
+		}
+	}
+	return 0;
+}
+
+
+static const char *parse_voltage(const char *s, int *volt)
+{
+	char *end;
+	double x;
+
+	x = strtod(s, &end);
+	if (*end)
+		return "voltage has to be float or empty";
+	if (x < 7 || x > 10)
+		return "voltage out of range";
+	*volt = round(x * 100);
+	return 0;
+}
+
+static const char *parse_frequency(const char *s, int *freq)
+{
+	char *end;
+
+	*freq = strtoul(s, &end, 10);
+	if (*end)
+		return "frequency has to be integer";
+	return  0;
+}
+
+
+static const char *set_voltages(const char *arg, int *voltages)
+{
+	return parse_optlist(arg, voltages, BITMAIN_MAX_CHAIN_NUM, parse_voltage);
+}
+
+static const char *set_frequencies(const char *arg, int *freqs)
+{
+	return parse_optlist(arg, freqs, BITMAIN_MAX_CHAIN_NUM, parse_frequency);
 }
 
 
@@ -1555,20 +1638,19 @@ static struct opt_table opt_config_table[] =
     "Set bitmain fan pwm percentage 0~100"),
 
     OPT_WITH_ARG("--bitmain-freq",
-    set_int_0_to_9999,opt_show_intval, &opt_bitmain_c5_freq,
-    "Set frequency"),
+    set_frequencies, 0, &chain_frequency_settings,
+    "Set frequencies"),
 
     OPT_WITH_ARG("--bitmain-voltage",
-    set_int_0_to_9999,opt_show_intval, &opt_bitmain_c5_voltage,
-    "Set voltage"),
-
+    set_voltages, 0, &chain_voltage_settings,
+    "Set voltages"),
 
     OPT_WITHOUT_ARG("--fixed-freq",
     opt_set_bool, &opt_fixed_freq,
     "Set bitmain miner use fixed freq"),
 
     OPT_WITHOUT_ARG("--no-pre-heat",
-    opt_set_false, &opt_pre_heat,
+    opt_set_invbool, &opt_pre_heat,
     "Set bitmain miner doesn't pre heat"),
 
 
@@ -3450,6 +3532,8 @@ static void share_result(
     {
         mutex_lock(&stats_lock);
 
+	if (work->chain_id < BITMAIN_MAX_CHAIN_NUM)
+		g_accepted[work->chain_id]++;
         cgpu->accepted++;
         total_accepted++;
         pool->accepted++;
@@ -3512,6 +3596,8 @@ static void share_result(
     else
     {
         mutex_lock(&stats_lock);
+	if (work->chain_id < BITMAIN_MAX_CHAIN_NUM)
+		g_rejected[work->chain_id]++;
         cgpu->rejected++;
         total_rejected++;
         pool->rejected++;
@@ -5839,6 +5925,18 @@ static char *json_escape(char *str)
     return buf;
 }
 
+static void write_voltages(FILE *fcfg, const int *voltages)
+{
+	int i, n;
+
+	for (n = BITMAIN_MAX_CHAIN_NUM; n > 0; n--) {
+		if (voltages[n - 1] != 0)
+			break;
+	}
+	for (i = 0; i < n; i++) {
+		fprintf(fcfg, "%s%.2lf", i > 0 ? "," : "", voltages[i] / 100.0);
+	}
+}
 
 void write_config(FILE *fcfg)
 {
@@ -5925,6 +6023,28 @@ void write_config(FILE *fcfg)
                 fprintf(fcfg, ",\n\"%s\" : \"%d\"", p+2, *(int *)opt->u.arg);
                 continue;
             }
+
+            if (opt->type & OPT_HASARG &&
+                ((void *)opt->cb_arg == set_voltages))
+            {
+                fprintf(fcfg, ",\n\"%s\" : \"", p + 2);
+		write_voltages(fcfg, chain_voltage_settings);
+                fprintf(fcfg, "\"");
+                continue;
+            }
+
+#if 0
+            if (opt->type & OPT_HASARG &&
+                ((void *)opt->cb_arg == set_voltage))
+            {
+		int vol = *(int *)opt->u.arg;
+		if (vol != 0) {
+                    fprintf(fcfg, ",\n\"%s\" : \"%.2lf\"", p + 2, vol/100.0);
+		}
+                continue;
+            }
+#endif
+
 
             if (opt->type & OPT_HASARG &&
                 (((void *)opt->cb_arg == (void *)set_float_125_to_500) ||
@@ -7577,17 +7697,17 @@ static void *stratum_sthread(void *userdata)
         sshare->id = swork_id++;
         mutex_unlock(&sshare_lock);
 
-        if(pool->support_vil)
+#ifdef USE_BITMAIN_C5
+	uint32_t nversion = (uint32_t)strtoul(pool->bbversion, NULL, 16);
+	uint32_t nversionbe = htobe32(work->version);
+	uint32_t smask = nversion;
+	smask ^= nversionbe;
+	applog(LOG_ERR, "Version submitting share mask 0x%08" PRIx32 " with work version 0x%08" PRIx32 " and pool version 0x%08" PRIx32, smask, nversionbe, nversion);
+#endif
+
+        if(pool->supports_version_rolling)
         {
-            snprintf(s, sizeof(s),
-                     "{\"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%08x\"], \"id\": %d, \"method\": \"mining.submit\"}",
-                     pool->rpc_user,
-                     work->job_id,
-                     nonce2hex,
-                     work->ntime,
-                     noncehex,
-                     swab32(work->version),
-                     sshare->id);
+	    snprintf(s, sizeof(s), "{\"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%08" PRIx32 "\"], \"id\": %d, \"method\": \"mining.submit\"}", pool->rpc_user, work->job_id, nonce2hex, work->ntime, noncehex, smask, sshare->id);
         }
         else
         {
@@ -8213,7 +8333,6 @@ void get_work_by_nonce2(struct thr_info *thr,
     struct device_drv *drv = cgpu->drv;
     cg_wlock(&pool->data_lock);
     pool->nonce2 = nonce2;
-    //if(pool->support_vil) // comment as default
     version = Swap32(version);
     cg_memcpy(pool->header_bin, &version, 4);
     cg_wunlock(&pool->data_lock);
